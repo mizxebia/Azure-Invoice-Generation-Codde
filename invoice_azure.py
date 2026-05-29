@@ -16,10 +16,32 @@ CONFIG_PATH = Path(__file__).with_name("config.json")
  
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
  
-BASE_FOLDER = (
-    "New Sales RPA/DEV/"
-    "BotShareDrive/InProgress"
-)
+ENVIRONMENT_SETTINGS = {
+    "DEV": {
+        "user_email_key": "user_email_dev",
+        "user_email": "akambotdev1@akam.com",
+        "invoice_template_path": (
+            "New Sales RPA/DEV/Excel Sheets/Closing Forms deposits.xlsx"
+        ),
+        "base_folder": "New Sales RPA/DEV/BotShareDrive/InProgress",
+    },
+    "UAT": {
+        "user_email_key": "user_email_uat",
+        "user_email": "akambotuat2@akam.com",
+        "invoice_template_path": (
+            "New Sales RPA/UAT/Excel Sheets/Closing Forms deposits.xlsx"
+        ),
+        "base_folder": "New Sales RPA/UAT/BotShareDrive/InProgress",
+    },
+    "PROD": {
+        "user_email_key": "user_email_prod",
+        "user_email": "akambotnewsalesclosure@akam.com",
+        "invoice_template_path": (
+            "New Sales RPA/PROD/Excel Sheets/Closing Forms deposits.xlsx"
+        ),
+        "base_folder": "New Sales RPA/PROD/BotShareDrive/InProgress",
+    },
+}
  
 
 PAYABLE_MAP = {
@@ -79,6 +101,11 @@ DUE_AT_CLOSING_MAP = {
     396620040: "Over-Time Fee",
     396620041: "Parking",
     396620042: "POA Fee",
+    396620043: "Processing Fee",
+    396620044: "Purchaser Fee (Transfer Fee)",
+    396620045: "Real Estate Tax",
+    396620046: "Recognition Agreement",
+    396620047: "Repair Charge",
     396620048: "Resident Manager Contribution",
     396620049: "Security Deposit",
     396620050: "Service Fee",
@@ -108,6 +135,101 @@ def load_config():
         return json.load(config_file)
  
  
+def normalize_environment(env_value):
+
+    env = (
+        env_value
+        or "DEV"
+    ).strip().upper()
+
+    if env not in ENVIRONMENT_SETTINGS:
+
+        valid_envs = ", ".join(
+            ENVIRONMENT_SETTINGS
+        )
+
+        raise ValueError(
+            f"Invalid environment '{env}'. "
+            f"Use one of: {valid_envs}."
+        )
+
+    return env
+
+
+def get_runtime_settings(config, env):
+
+    storage = config["storage"]
+
+    auth_config = config["auth"]
+
+    dv = config["dataverse"]
+
+    env_settings = ENVIRONMENT_SETTINGS[
+        env
+    ]
+
+    dataverse = (
+        auth_config
+        .get("dataverse_by_env", {})
+        .get(env, {})
+    )
+
+    if env != "DEV" and not dataverse:
+
+        raise ValueError(
+            f"Missing Dataverse config for "
+            f"environment '{env}'. Add "
+            f"auth.dataverse_by_env.{env} "
+            "to config.json."
+        )
+
+    tables = (
+        dv.get("tables_by_env", {}).get(env)
+        or dv.get(f"tables_{env.lower()}")
+        or dv["tables"]
+    )
+
+    return {
+        "env": env,
+        "user_email": storage.get(
+            env_settings["user_email_key"],
+            env_settings["user_email"],
+        ),
+        "invoice_template_path": (
+            env_settings[
+                "invoice_template_path"
+            ]
+        ),
+        "base_folder": (
+            env_settings["base_folder"]
+        ),
+        "dataverse_tables": tables,
+        "dataverse_url": dataverse.get(
+            "dataverse_url",
+            auth_config["dataverse_url"],
+        ),
+        "dataverse_scope": dataverse.get(
+            "dataverse_scope",
+            auth_config["dataverse_scope"],
+        ),
+    }
+
+
+def get_request_value(req, name, default=None):
+
+    value = req.params.get(name)
+
+    if value is not None:
+        return value
+
+    try:
+        body = req.get_json()
+    except ValueError:
+        body = {}
+
+    return body.get(name, default)
+
+
 config = load_config()
  
 auth = config["auth"]
@@ -194,6 +316,7 @@ def get_access_token(scope):
 # =====================================
  
 def fetch_table(
+    dataverse_url,
     table_name,
     token,
     ticket_column,
@@ -210,7 +333,7 @@ def fetch_table(
     }
  
     url = (
-        f"{auth['dataverse_url']}"
+        f"{dataverse_url}"
         f"/api/data/v9.2/"
         f"{table_name}"
         f"?$filter="
@@ -251,6 +374,69 @@ def fetch_table(
     return all_records
  
  
+def validate_required_dataverse_data(
+    env,
+    ticket_value,
+    closing_data,
+    invoice_data,
+    closing_table,
+    invoice_table,
+):
+
+    errors = []
+
+    if not closing_data:
+
+        errors.append(
+            "No Closing Ticket Details "
+            "records found in table "
+            f"'{closing_table}' for ticket "
+            f"'{ticket_value}'."
+        )
+
+    if not invoice_data:
+
+        errors.append(
+            "No Invoice Details records "
+            f"found in table '{invoice_table}' "
+            f"for ticket '{ticket_value}'."
+        )
+
+    if errors:
+
+        raise ValueError(
+            f"Dataverse data missing for "
+            f"environment '{env}'. "
+            + " ".join(errors)
+        )
+
+
+def get_choice_label(mapping, value):
+
+    if value in (
+        None,
+        ""
+    ) or pd.isna(value):
+
+        return ""
+
+    try:
+
+        normalized_value = int(value)
+
+    except (
+        TypeError,
+        ValueError
+    ):
+
+        normalized_value = value
+
+    return mapping.get(
+        normalized_value,
+        ""
+    )
+
+
 # =====================================
 # GRAPH HELPERS
 # =====================================
@@ -539,11 +725,12 @@ def archive_active_file_if_exists(
 def setup_ticket_folders(
     token,
     user_email,
+    base_folder,
     ticket_id,
 ):
  
     ticket_folder = (
-        f"{BASE_FOLDER}/"
+        f"{base_folder}/"
         f"{ticket_id}"
     )
  
@@ -900,12 +1087,12 @@ def populate_excel_template(
         ""
     )
 
-    deal = TRANSACTION_TYPE_DEAL_MAP.get(
+    deal = get_choice_label(
+        TRANSACTION_TYPE_DEAL_MAP,
         row.get(
             "cr109_transactiontypedeal",
             ""
-        ),
-        ""
+        )
     )
 
     buyer1_name = row.get(
@@ -1105,20 +1292,20 @@ def populate_excel_template(
 
         row_number = 15 + idx
 
-        due_at_closing = DUE_AT_CLOSING_MAP.get(
+        due_at_closing = get_choice_label(
+            DUE_AT_CLOSING_MAP,
             inv_row.get(
                 "cr109_dueatclosing",
                 ""
-            ),
-            "",
+            )
         )
 
-        payable_to = PAYABLE_MAP.get(
+        payable_to = get_choice_label(
+            PAYABLE_MAP,
             inv_row.get(
                 "cr7de_payableto",
                 ""
-            ),
-            ""
+            )
         )
 
         patch(
@@ -1148,20 +1335,20 @@ def populate_excel_template(
 
         row_number = 45 + idx
 
-        due_at_closing = DUE_AT_CLOSING_MAP.get(
+        due_at_closing = get_choice_label(
+            DUE_AT_CLOSING_MAP,
             inv_row.get(
                 "cr109_dueatclosing",
                 ""
-            ),
-            "",
+            )
         )
 
-        payable_to = PAYABLE_MAP.get(
+        payable_to = get_choice_label(
+            PAYABLE_MAP,
             inv_row.get(
                 "cr7de_payableto",
                 ""
-            ),
-            ""
+            )
         )
 
         patch(
@@ -1241,6 +1428,7 @@ def convert_onedrive_file_to_pdf(
 def upload_file_to_onedrive(
     token,
     user_email,
+    base_folder,
     ticket_id,
     local_file_path,
     onedrive_file_name,
@@ -1256,8 +1444,7 @@ def upload_file_to_onedrive(
     }
  
     onedrive_folder = (
-        "New Sales RPA/DEV/"
-        f"BotShareDrive/InProgress/"
+        f"{base_folder}/"
         f"{ticket_id}"
     )
  
@@ -1309,9 +1496,29 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
  
     try:
  
-        env = req.params.get("env")
+        env = normalize_environment(
+            get_request_value(
+                req,
+                "env",
+                "DEV"
+            )
+        )
  
-        ticket_value = req.params.get("id")
+        runtime = get_runtime_settings(
+            config,
+            env,
+        )
+ 
+        ticket_value = get_request_value(
+            req,
+            "id",
+        )
+ 
+        if not ticket_value:
+ 
+            ticket_value = config[
+                "dataverse"
+            ]["filter"]["ticket_id"]
  
         logger.info(
             f"Environment: {env}"
@@ -1324,7 +1531,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
  
         dv_token = get_access_token(
  
-            config["auth"][
+            runtime[
                 "dataverse_scope"
             ]
         )
@@ -1338,23 +1545,30 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
  
         dv = config["dataverse"]
  
-        storage = config["storage"]
+        dv_tables = runtime[
+            "dataverse_tables"
+        ]
+ 
+        dataverse_url = runtime[
+            "dataverse_url"
+        ]
  
         ticket_column = (
             dv["columns"]["ticket_id"]
         )
  
         template_path = (
-            storage["paths"][
+            runtime[
                 "invoice_template_path"
-            ].replace(
-                "PROD",
-                env,
-            )
+            ]
         )
  
-        user_email = storage[
-            "user_email_dev"
+        user_email = runtime[
+            "user_email"
+        ]
+ 
+        base_folder = runtime[
+            "base_folder"
         ]
  
         output_excel_name = (
@@ -1370,11 +1584,24 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             f"_Closing_Form.pdf"
         )
  
+        logger.info(
+            f"Dataverse URL: "
+            f"{dataverse_url}"
+        )
+ 
+        closing_table = dv_tables[
+            "closing_ticket_details"
+        ]
+ 
+        invoice_table = dv_tables[
+            "invoice_details"
+        ]
+ 
         closing_data = fetch_table(
  
-            dv["tables"][
-                "closing_ticket_details"
-            ],
+            dataverse_url,
+ 
+            closing_table,
  
             dv_token,
  
@@ -1385,15 +1612,30 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
  
         invoice_data = fetch_table(
  
-            dv["tables"][
-                "invoice_details"
-            ],
+            dataverse_url,
+ 
+            invoice_table,
  
             dv_token,
  
             ticket_column,
  
             ticket_value,
+        )
+ 
+        validate_required_dataverse_data(
+ 
+            env,
+ 
+            ticket_value,
+ 
+            closing_data,
+ 
+            invoice_data,
+ 
+            closing_table,
+ 
+            invoice_table,
         )
  
         df_closing = pd.DataFrame(
@@ -1423,6 +1665,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             graph_token,
  
             user_email,
+ 
+            base_folder,
  
             ticket_value,
         )
@@ -1512,6 +1756,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             graph_token,
  
             user_email,
+ 
+            base_folder,
  
             f"{ticket_value}/Active",
  

@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import argparse
 import time
 import traceback
 from datetime import datetime
@@ -13,7 +14,33 @@ from msal import ConfidentialClientApplication
 
 CONFIG_PATH = Path(__file__).with_name("config.json")
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
-BASE_FOLDER = "New Sales RPA/DEV/BotShareDrive/InProgress"
+
+ENVIRONMENT_SETTINGS = {
+    "DEV": {
+        "user_email_key": "user_email_dev",
+        "user_email": "akambotdev1@akam.com",
+        "invoice_template_path": (
+            "New Sales RPA/DEV/Excel Sheets/Closing Forms deposits.xlsx"
+        ),
+        "base_folder": "New Sales RPA/DEV/BotShareDrive/InProgress",
+    },
+    "UAT": {
+        "user_email_key": "user_email_uat",
+        "user_email": "akambotuat2@akam.com",
+        "invoice_template_path": (
+            "New Sales RPA/UAT/Excel Sheets/Closing Forms deposits.xlsx"
+        ),
+        "base_folder": "New Sales RPA/UAT/BotShareDrive/InProgress",
+    },
+    "PROD": {
+        "user_email_key": "user_email_prod",
+        "user_email": "akambotnewsalesclosure@akam.com",
+        "invoice_template_path": (
+            "New Sales RPA/PROD/Excel Sheets/Closing Forms deposits.xlsx"
+        ),
+        "base_folder": "New Sales RPA/PROD/BotShareDrive/InProgress",
+    },
+}
 
 
 PAYABLE_MAP = {
@@ -73,6 +100,11 @@ DUE_AT_CLOSING_MAP = {
     396620040: "Over-Time Fee",
     396620041: "Parking",
     396620042: "POA Fee",
+    396620043: "Processing Fee",
+    396620044: "Purchaser Fee (Transfer Fee)",
+    396620045: "Real Estate Tax",
+    396620046: "Recognition Agreement",
+    396620047: "Repair Charge",
     396620048: "Resident Manager Contribution",
     396620049: "Security Deposit",
     396620050: "Service Fee",
@@ -90,6 +122,66 @@ DUE_AT_CLOSING_MAP = {
 def load_config():
     with open(CONFIG_PATH, "r", encoding="utf-8") as config_file:
         return json.load(config_file)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Generate closing form invoice files."
+    )
+    parser.add_argument(
+        "environment",
+        nargs="?",
+        help="Target environment: DEV, UAT, or PROD.",
+    )
+    parser.add_argument(
+        "--env",
+        dest="env",
+        help="Target environment: DEV, UAT, or PROD.",
+    )
+    return parser.parse_args()
+
+
+def normalize_environment(env_value):
+    env = (env_value or "DEV").strip().upper()
+
+    if env not in ENVIRONMENT_SETTINGS:
+        valid_envs = ", ".join(ENVIRONMENT_SETTINGS)
+        raise ValueError(f"Invalid environment '{env}'. Use one of: {valid_envs}.")
+
+    return env
+
+
+def get_runtime_settings(config, env):
+    storage = config["storage"]
+    auth_config = config["auth"]
+    dv = config["dataverse"]
+    env_settings = ENVIRONMENT_SETTINGS[env]
+    dataverse = auth_config.get("dataverse_by_env", {}).get(env, {})
+
+    tables = (
+        dv.get("tables_by_env", {}).get(env)
+        or dv.get(f"tables_{env.lower()}")
+        or dv["tables"]
+    )
+
+    return {
+        "env": env,
+        "user_email": storage.get(
+            env_settings["user_email_key"],
+            env_settings["user_email"],
+        ),
+        "invoice_template_path": env_settings["invoice_template_path"],
+        "base_folder": env_settings["base_folder"],
+        "dataverse_tables": tables,
+        "dataverse_url": dataverse.get(
+            "dataverse_url",
+            auth_config["dataverse_url"],
+        ),
+        "dataverse_scope": dataverse.get(
+            "dataverse_scope",
+            auth_config["dataverse_scope"],
+        ),
+    }
 
 
 config = load_config()
@@ -152,6 +244,80 @@ def fetch_table(table_name, token, ticket_column, ticket_value):
     return all_records
 
 
+def fetch_table_from_dataverse_url(
+    dataverse_url,
+    table_name,
+    token,
+    ticket_column,
+    ticket_value,
+):
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+
+    url = (
+        f"{dataverse_url}/api/data/v9.2/{table_name}"
+        f"?$filter={ticket_column} eq '{ticket_value}'"
+    )
+
+    all_records = []
+
+    while url:
+        response = requests.get(url, headers=headers)
+
+        if response.status_code != 200:
+            raise Exception(response.text)
+
+        data = response.json()
+        all_records.extend(data.get("value", []))
+        url = data.get("@odata.nextLink")
+
+    return all_records
+
+
+def validate_required_dataverse_data(
+    env,
+    ticket_value,
+    closing_data,
+    invoice_data,
+    closing_table,
+    invoice_table,
+):
+    errors = []
+
+    if not closing_data:
+        errors.append(
+            "No Closing Ticket Details records found "
+            f"in table '{closing_table}' for ticket '{ticket_value}'."
+        )
+
+    if not invoice_data:
+        errors.append(
+            "No Invoice Details records found "
+            f"in table '{invoice_table}' for ticket '{ticket_value}'."
+        )
+
+    if errors:
+        message = (
+            f"Dataverse data missing for environment '{env}'. "
+            + " ".join(errors)
+        )
+        raise ValueError(message)
+
+
+def get_choice_label(mapping, value):
+    if value in (None, "") or pd.isna(value):
+        return ""
+
+    try:
+        normalized_value = int(value)
+    except (TypeError, ValueError):
+        normalized_value = value
+
+    return mapping.get(normalized_value, "")
+
+
 def _headers(token, extra=None):
     headers = {
         "Authorization": f"Bearer {token}",
@@ -178,8 +344,8 @@ def get_onedrive_file(token, user_email, file_path):
     return response.json()
 
 
-def create_onedrive_folder(token, user_email, ticket_id):
-    parent_path = "New Sales RPA/DEV/BotShareDrive/InProgress"
+def create_onedrive_folder(token, user_email, base_folder, ticket_id):
+    parent_path = base_folder
     url = (
         f"{GRAPH_BASE}/users/{user_email}"
         f"/drive/root:/{parent_path}:/children"
@@ -201,6 +367,7 @@ def create_onedrive_folder(token, user_email, ticket_id):
 def upload_file_to_onedrive(
     token,
     user_email,
+    base_folder,
     ticket_id,
     local_file_path,
     onedrive_file_name,
@@ -212,10 +379,7 @@ def upload_file_to_onedrive(
         ),
     }
 
-    onedrive_folder = (
-        "New Sales RPA/DEV/"
-        f"BotShareDrive/InProgress/{ticket_id}"
-    )
+    onedrive_folder = f"{base_folder}/{ticket_id}"
     url = (
         f"{GRAPH_BASE}/users/{user_email}"
         f"/drive/root:/{onedrive_folder}/"
@@ -336,8 +500,8 @@ def _delete_file(token, user_email, file_path):
         raise Exception(f"Failed to delete '{file_path}': {response.text}")
 
 
-def setup_ticket_folders(token, user_email, ticket_id):
-    ticket_folder = f"{BASE_FOLDER}/{ticket_id}"
+def setup_ticket_folders(token, user_email, base_folder, ticket_id):
+    ticket_folder = f"{base_folder}/{ticket_id}"
     active_folder = f"{ticket_folder}/Active"
     inactive_folder = f"{ticket_folder}/Inactive"
 
@@ -524,7 +688,10 @@ def populate_excel_template(
     property_address = row.get("cr7de_buildingaddress", "")
     unit = row.get("cr7de_unitnumber", "")
     seller1_name = row.get("cr7de_sellername", "")
-    deal = TRANSACTION_TYPE_DEAL_MAP.get(row.get("cr109_transactiontypedeal", ""), "")
+    deal = get_choice_label(
+        TRANSACTION_TYPE_DEAL_MAP,
+        row.get("cr109_transactiontypedeal", ""),
+    )
     buyer1_name = row.get("cr7de_buyername", "")
     shares = row.get("cr109_shares", "")
     closing_agent = row.get("cr7de_closingagentname", "")
@@ -571,11 +738,14 @@ def populate_excel_template(
 
     for idx, (_, inv_row) in enumerate(seller_df.iterrows()):
         row_number = 15 + idx
-        due_at_closing = DUE_AT_CLOSING_MAP.get(
+        due_at_closing = get_choice_label(
+            DUE_AT_CLOSING_MAP,
             inv_row.get("cr109_dueatclosing", ""),
-            "",
         )
-        payable_to = PAYABLE_MAP.get(inv_row.get("cr7de_payableto", ""), "")
+        payable_to = get_choice_label(
+            PAYABLE_MAP,
+            inv_row.get("cr7de_payableto", ""),
+        )
 
         patch(
             f"A{row_number}:D{row_number}",
@@ -591,11 +761,14 @@ def populate_excel_template(
 
     for idx, (_, inv_row) in enumerate(buyer_df.iterrows()):
         row_number = 45 + idx
-        due_at_closing = DUE_AT_CLOSING_MAP.get(
+        due_at_closing = get_choice_label(
+            DUE_AT_CLOSING_MAP,
             inv_row.get("cr109_dueatclosing", ""),
-            "",
         )
-        payable_to = PAYABLE_MAP.get(inv_row.get("cr7de_payableto", ""), "")
+        payable_to = get_choice_label(
+            PAYABLE_MAP,
+            inv_row.get("cr7de_payableto", ""),
+        )
 
         patch(
             f"A{row_number}:D{row_number}",
@@ -631,30 +804,63 @@ def convert_onedrive_file_to_pdf(token, user_email, file_path, pdf_output_path):
 
 
 def main():
-    dv_token = get_access_token(config["auth"]["dataverse_scope"])
+    args = parse_args()
+    env = normalize_environment(
+        args.env
+        or args.environment
+        or os.getenv("APP_ENV")
+        or os.getenv("ENV")
+        or config.get("environment")
+    )
+    runtime = get_runtime_settings(config, env)
+
+    dv_token = get_access_token(runtime["dataverse_scope"])
     graph_token = get_access_token(config["auth"]["graph_scope"])
 
     dv = config["dataverse"]
-    storage = config["storage"]
+    dv_tables = runtime["dataverse_tables"]
+    dataverse_url = runtime["dataverse_url"]
 
     ticket_column = dv["columns"]["ticket_id"]
     ticket_value = dv["filter"]["ticket_id"]
-    template_path = storage["paths"]["invoice_template_path"]
-    user_email = storage["user_email_dev"]
+    template_path = runtime["invoice_template_path"]
+    user_email = runtime["user_email"]
+    base_folder = runtime["base_folder"]
     output_excel_name = f"{ticket_value}_Closing_Form.xlsx"
     pdf_output_path = f"{ticket_value}_Closing_Form.pdf"
 
-    closing_data = fetch_table(
-        dv["tables"]["closing_ticket_details"],
+    print(f"\nEnvironment: {env}")
+    print(f"OneDrive user: {user_email}")
+    print(f"Dataverse URL: {dataverse_url}")
+
+    closing_table = dv_tables["closing_ticket_details"]
+    invoice_table = dv_tables["invoice_details"]
+
+    closing_data = fetch_table_from_dataverse_url(
+        dataverse_url,
+        closing_table,
         dv_token,
         ticket_column,
         ticket_value,
     )
-    invoice_data = fetch_table(
-        dv["tables"]["invoice_details"],
+    invoice_data = fetch_table_from_dataverse_url(
+        dataverse_url,
+        invoice_table,
         dv_token,
         ticket_column,
         ticket_value,
+    )
+
+    print(f"Closing Ticket Details records: {len(closing_data)}")
+    print(f"Invoice Details records: {len(invoice_data)}")
+
+    validate_required_dataverse_data(
+        env,
+        ticket_value,
+        closing_data,
+        invoice_data,
+        closing_table,
+        invoice_table,
     )
 
     df_closing = pd.DataFrame(closing_data)
@@ -663,6 +869,7 @@ def main():
     active_folder, inactive_folder = setup_ticket_folders(
         graph_token,
         user_email,
+        base_folder,
         ticket_value,
     )
 
@@ -711,6 +918,7 @@ def main():
     upload_file_to_onedrive(
         graph_token,
         user_email,
+        base_folder,
         f"{ticket_value}/Active",
         pdf_output_path,
         pdf_output_path,
