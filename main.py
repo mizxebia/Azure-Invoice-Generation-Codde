@@ -14,6 +14,7 @@ from msal import ConfidentialClientApplication
 
 CONFIG_PATH = Path(__file__).with_name("config.json")
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+CLOSING_PDF_FILE_COLUMN = "cr109_closingticketdetailspdf"
 
 ENVIRONMENT_SETTINGS = {
     "DEV": {
@@ -318,6 +319,19 @@ def get_choice_label(mapping, value):
     return mapping.get(normalized_value, "")
 
 
+def get_row_id(row, table_name):
+    primary_key = table_name[:-2] + "id" if table_name.endswith("es") else f"{table_name}id"
+
+    if primary_key in row:
+        return row[primary_key]
+
+    for key, value in row.items():
+        if key.endswith("id") and not key.startswith("_"):
+            return value
+
+    raise ValueError(f"Could not determine Dataverse row id for table '{table_name}'.")
+
+
 def _headers(token, extra=None):
     headers = {
         "Authorization": f"Bearer {token}",
@@ -395,6 +409,41 @@ def upload_file_to_onedrive(
         raise Exception(response.text)
 
     print("File uploaded successfully")
+
+
+def upload_file_to_dataverse_file_column(
+    dataverse_url,
+    table_name,
+    row_id,
+    token,
+    file_column,
+    local_file_path,
+    file_name,
+):
+    url = (
+        f"{dataverse_url}/api/data/v9.2/{table_name}"
+        f"({row_id})/{file_column}"
+    )
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "OData-MaxVersion": "4.0",
+        "OData-Version": "4.0",
+        "If-None-Match": "null",
+        "Accept": "application/json",
+        "Content-Type": "application/octet-stream",
+        "x-ms-file-name": file_name,
+    }
+
+    with open(local_file_path, "rb") as file:
+        response = requests.patch(url, headers=headers, data=file.read())
+
+    if response.status_code != 204:
+        raise Exception(
+            f"Failed to upload PDF to Dataverse file column "
+            f"'{file_column}': {response.text}"
+        )
+
+    print(f"Uploaded PDF to Dataverse column: {table_name}.{file_column}")
 
 
 def _ensure_folder(token, user_email, folder_path):
@@ -865,6 +914,7 @@ def main():
 
     df_closing = pd.DataFrame(closing_data)
     df_invoice = pd.DataFrame(invoice_data)
+    closing_row_id = get_row_id(closing_data[0], closing_table)
 
     active_folder, inactive_folder = setup_ticket_folders(
         graph_token,
@@ -920,6 +970,16 @@ def main():
         user_email,
         base_folder,
         f"{ticket_value}/Active",
+        pdf_output_path,
+        pdf_output_path,
+    )
+
+    upload_file_to_dataverse_file_column(
+        dataverse_url,
+        closing_table,
+        closing_row_id,
+        dv_token,
+        CLOSING_PDF_FILE_COLUMN,
         pdf_output_path,
         pdf_output_path,
     )

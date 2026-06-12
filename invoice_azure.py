@@ -15,6 +15,7 @@ from msal import ConfidentialClientApplication
 CONFIG_PATH = Path(__file__).with_name("config.json")
  
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+CLOSING_PDF_FILE_COLUMN = "cr109_closingticketdetailspdf"
  
 ENVIRONMENT_SETTINGS = {
     "DEV": {
@@ -434,6 +435,33 @@ def get_choice_label(mapping, value):
     return mapping.get(
         normalized_value,
         ""
+    )
+
+
+def get_row_id(row, table_name):
+
+    primary_key = (
+        table_name[:-2] + "id"
+        if table_name.endswith("es")
+        else f"{table_name}id"
+    )
+
+    if primary_key in row:
+
+        return row[primary_key]
+
+    for key, value in row.items():
+
+        if (
+            key.endswith("id")
+            and not key.startswith("_")
+        ):
+
+            return value
+
+    raise ValueError(
+        f"Could not determine Dataverse "
+        f"row id for table '{table_name}'."
     )
 
 
@@ -1489,6 +1517,75 @@ def upload_file_to_onedrive(
     )
  
  
+def upload_file_to_dataverse_file_column(
+    dataverse_url,
+    table_name,
+    row_id,
+    token,
+    file_column,
+    local_file_path,
+    file_name,
+):
+
+    url = (
+        f"{dataverse_url}/api/data/v9.2/"
+        f"{table_name}({row_id})/"
+        f"{file_column}"
+    )
+
+    headers = {
+
+        "Authorization":
+            f"Bearer {token}",
+
+        "OData-MaxVersion":
+            "4.0",
+
+        "OData-Version":
+            "4.0",
+
+        "If-None-Match":
+            "null",
+
+        "Accept":
+            "application/json",
+
+        "Content-Type":
+            "application/octet-stream",
+
+        "x-ms-file-name":
+            file_name,
+    }
+
+    with open(
+        local_file_path,
+        "rb"
+    ) as file:
+
+        response = requests.patch(
+            url,
+            headers=headers,
+            data=file.read(),
+        )
+
+    if response.status_code != 204:
+
+        logger.error(response.text)
+
+        raise Exception(
+            f"Failed to upload PDF to "
+            f"Dataverse file column "
+            f"'{file_column}': "
+            f"{response.text}"
+        )
+
+    logger.info(
+        f"Uploaded PDF to Dataverse "
+        f"column: {table_name}."
+        f"{file_column}"
+    )
+
+
 # =====================================
 # MAIN
 # =====================================
@@ -1645,6 +1742,11 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         df_invoice = pd.DataFrame(
             invoice_data
         )
+
+        closing_row_id = get_row_id(
+            closing_data[0],
+            closing_table,
+        )
  
         logger.info(
             f"Closing DF Shape: "
@@ -1763,6 +1865,24 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
  
             pdf_output_path,
  
+            f"{ticket_value}"
+            f"_Closing_Form.pdf",
+        )
+
+        upload_file_to_dataverse_file_column(
+
+            dataverse_url,
+
+            closing_table,
+
+            closing_row_id,
+
+            dv_token,
+
+            CLOSING_PDF_FILE_COLUMN,
+
+            pdf_output_path,
+
             f"{ticket_value}"
             f"_Closing_Form.pdf",
         )

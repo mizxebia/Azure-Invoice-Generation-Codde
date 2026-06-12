@@ -2,3 +2,4 @@ requests
 pandas
 msal
 openpyxl
+azure-functions
