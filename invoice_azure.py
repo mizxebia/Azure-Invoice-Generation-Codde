@@ -750,6 +750,151 @@ def archive_active_file_if_exists(
     )
 
 
+def _list_folder_children(
+    token,
+    user_email,
+    folder_path,
+):
+    """Return list of file items inside a OneDrive folder."""
+
+    url = (
+        f"{GRAPH_BASE}/users/"
+        f"{user_email}"
+        f"/drive/root:/"
+        f"{folder_path}"
+        f":/children"
+    )
+
+    all_items = []
+
+    while url:
+
+        response = requests.get(
+            url,
+            headers=_headers(token)
+        )
+
+        if response.status_code == 404:
+            return []
+
+        if response.status_code != 200:
+
+            raise Exception(
+                f"Failed to list folder "
+                f"'{folder_path}': "
+                f"{response.text}"
+            )
+
+        data = response.json()
+
+        all_items.extend(
+            data.get("value", [])
+        )
+
+        url = data.get(
+            "@odata.nextLink"
+        )
+
+    return all_items
+
+
+def archive_active_files_by_prefix(
+    token,
+    user_email,
+    active_folder,
+    inactive_folder,
+    file_prefix,
+):
+    """Archive every file in active_folder whose name starts with file_prefix."""
+
+    items = _list_folder_children(
+        token,
+        user_email,
+        active_folder,
+    )
+
+    matching = [
+        item for item in items
+        if "folder" not in item
+        and item.get("name", "").startswith(
+            file_prefix
+        )
+    ]
+
+    if not matching:
+
+        logger.info(
+            f"No files matching prefix "
+            f"'{file_prefix}' in Active "
+            f"- skipping"
+        )
+
+        return
+
+    now = datetime.now()
+
+    date_str = now.strftime(
+        "%Y-%m-%d"
+    )
+
+    datetime_str = now.strftime(
+        "%Y-%m-%d_%H-%M-%S"
+    )
+
+    date_folder = (
+        f"{inactive_folder}/"
+        f"{date_str}"
+    )
+
+    _ensure_folder(
+        token,
+        user_email,
+        date_folder,
+    )
+
+    for item in matching:
+
+        file_name = item["name"]
+
+        active_file_path = (
+            f"{active_folder}/"
+            f"{file_name}"
+        )
+
+        name_parts = (
+            file_name.rsplit(".", 1)
+        )
+
+        if len(name_parts) == 2:
+
+            archived_name = (
+                f"{name_parts[0]}_"
+                f"{datetime_str}."
+                f"{name_parts[1]}"
+            )
+
+        else:
+
+            archived_name = (
+                f"{file_name}_"
+                f"{datetime_str}"
+            )
+
+        _move_and_rename_file(
+            token,
+            user_email,
+            active_file_path,
+            date_folder,
+            archived_name,
+        )
+
+        logger.info(
+            f"Archived to: "
+            f"{date_folder}/"
+            f"{archived_name}"
+        )
+
+
 def setup_ticket_folders(
     token,
     user_email,
@@ -1403,14 +1548,153 @@ def populate_excel_template(
 # =====================================
 # PDF
 # =====================================
- 
+
+def _get_worksheets(
+    token,
+    user_email,
+    file_path,
+    session_id,
+):
+
+    headers = _headers(
+        token,
+        {"workbook-session-id": session_id}
+    )
+
+    url = (
+        f"{GRAPH_BASE}/users/"
+        f"{user_email}"
+        f"/drive/root:/"
+        f"{file_path}"
+        f":/workbook/worksheets"
+    )
+
+    response = requests.get(
+        url,
+        headers=headers,
+    )
+
+    if response.status_code != 200:
+
+        raise Exception(
+            f"Failed to list worksheets: "
+            f"{response.text}"
+        )
+
+    return response.json().get(
+        "value", []
+    )
+
+
+def _set_worksheet_visibility(
+    token,
+    user_email,
+    file_path,
+    session_id,
+    sheet_name,
+    visibility,
+):
+
+    headers = _headers(
+        token,
+        {"workbook-session-id": session_id}
+    )
+
+    encoded_sheet = (
+        requests.utils.quote(sheet_name)
+    )
+
+    url = (
+        f"{GRAPH_BASE}/users/"
+        f"{user_email}"
+        f"/drive/root:/"
+        f"{file_path}"
+        f":/workbook/worksheets/"
+        f"{encoded_sheet}"
+    )
+
+    response = requests.patch(
+        url,
+        headers=headers,
+        json={"visibility": visibility},
+    )
+
+    if response.status_code != 200:
+
+        raise Exception(
+            f"Failed to set visibility "
+            f"'{visibility}' on sheet "
+            f"'{sheet_name}': "
+            f"{response.text}"
+        )
+
+
 def convert_onedrive_file_to_pdf(
     token,
     user_email,
     file_path,
     pdf_output_path,
 ):
- 
+
+    target_sheet = (
+        "Closing Check Transmittal Form"
+    )
+
+    # Hide all sheets except target before PDF conversion
+    session_id = create_workbook_session(
+        token,
+        user_email,
+        file_path,
+    )
+
+    hidden_sheets = []
+
+    try:
+
+        worksheets = _get_worksheets(
+            token,
+            user_email,
+            file_path,
+            session_id,
+        )
+
+        for ws in worksheets:
+
+            name = ws.get("name", "")
+            visibility = ws.get(
+                "visibility", "Visible"
+            )
+
+            if (
+                name != target_sheet
+                and visibility != "Hidden"
+            ):
+
+                _set_worksheet_visibility(
+                    token,
+                    user_email,
+                    file_path,
+                    session_id,
+                    name,
+                    "Hidden",
+                )
+
+                hidden_sheets.append(name)
+
+                logger.info(
+                    f"Hidden sheet: {name}"
+                )
+
+    finally:
+
+        close_workbook_session(
+            token,
+            user_email,
+            file_path,
+            session_id,
+        )
+
+    # Convert to PDF (only the visible sheet is included)
     url = (
         f"{GRAPH_BASE}/users/"
         f"{user_email}"
@@ -1418,39 +1702,72 @@ def convert_onedrive_file_to_pdf(
         f"{file_path}"
         f":/content?format=pdf"
     )
- 
+
     response = requests.get(
- 
         url,
- 
         headers=_headers(token)
     )
- 
+
     logger.info(
         f"PDF response: "
         f"{response.status_code}"
     )
- 
+
     if response.status_code != 200:
- 
+
         logger.error(response.text)
- 
+
         raise Exception(
             "PDF conversion failed"
         )
- 
+
     with open(
         pdf_output_path,
         "wb"
     ) as file:
- 
+
         file.write(
             response.content
         )
- 
+
     logger.info(
         "PDF generated"
     )
+
+    # Restore visibility of sheets that were hidden
+    if hidden_sheets:
+
+        session_id = create_workbook_session(
+            token,
+            user_email,
+            file_path,
+        )
+
+        try:
+
+            for name in hidden_sheets:
+
+                _set_worksheet_visibility(
+                    token,
+                    user_email,
+                    file_path,
+                    session_id,
+                    name,
+                    "Visible",
+                )
+
+                logger.info(
+                    f"Restored sheet: {name}"
+                )
+
+        finally:
+
+            close_workbook_session(
+                token,
+                user_email,
+                file_path,
+                session_id,
+            )
  
  
 def upload_file_to_onedrive(
@@ -1784,6 +2101,20 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             inactive_folder,
 
             output_excel_name,
+        )
+
+        # Archive any existing Condo Invoice files (.docx, .pdf, or any extension)
+        archive_active_files_by_prefix(
+
+            graph_token,
+
+            user_email,
+
+            active_folder,
+
+            inactive_folder,
+
+            f"{ticket_value}_Condo_Invoice",
         )
 
         output_file_path = (

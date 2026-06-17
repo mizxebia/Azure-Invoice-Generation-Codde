@@ -464,6 +464,75 @@ def archive_active_file_if_exists(
     logger.info(f"Archived existing file to {date_folder}/{archived_name}")
 
 
+def archive_closing_form_files_if_exist(
+    token,
+    user_email,
+    active_folder,
+    inactive_folder,
+    ticket_id,
+):
+    """Archive any Closing_Form files (pdf/xlsx) found in the active folder.
+
+    Looks for files whose names start with '<ticket_id>_Closing_Form' and
+    moves each one to Inactive/<today's date>/ with a timestamp suffix.
+    """
+    list_url = (
+        f"{GRAPH_BASE}/users/{user_email}"
+        f"/drive/root:/{active_folder}:/children"
+        f"?$select=name,id"
+    )
+
+    response = requests.get(list_url, headers=_headers(token))
+
+    if response.status_code == 404:
+        # Active folder doesn't exist yet — nothing to archive
+        return
+
+    if response.status_code != 200:
+        raise Exception(
+            f"Failed to list Active folder contents: {response.text}"
+        )
+
+    items = response.json().get("value", [])
+    prefix = f"{ticket_id}_Closing_Form"
+
+    matches = [
+        item for item in items
+        if item["name"].startswith(prefix)
+        and item["name"].lower().endswith((".pdf", ".xlsx"))
+    ]
+
+    if not matches:
+        logger.info("No Closing_Form files found in Active — skipping archive")
+        return
+
+    now = datetime.now()
+    date_str = now.strftime("%Y-%m-%d")
+    datetime_str = now.strftime("%Y-%m-%d_%H-%M-%S")
+    date_folder = f"{inactive_folder}/{date_str}"
+    _ensure_folder(token, user_email, date_folder)
+
+    for item in matches:
+        original_name = item["name"]
+        name_parts = original_name.rsplit(".", 1)
+        if len(name_parts) == 2:
+            archived_name = f"{name_parts[0]}_{datetime_str}.{name_parts[1]}"
+        else:
+            archived_name = f"{original_name}_{datetime_str}"
+
+        source_path = f"{active_folder}/{original_name}"
+        _move_and_rename_file(
+            token,
+            user_email,
+            source_path,
+            date_folder,
+            archived_name,
+        )
+        logger.info(
+            f"Archived Closing_Form file to: Inactive/{date_str}/{archived_name}"
+        )
+
+
 def setup_ticket_folders(token, user_email, base_folder, ticket_id):
     ticket_folder = f"{base_folder}/{ticket_id}"
     active_folder = f"{ticket_folder}/Active"
@@ -617,74 +686,97 @@ def get_content_control_by_tag(element, tag):
     return None
 
 
+def get_content_control_by_tag_anywhere(doc, tag):
+    """Find content control by tag name searching body, headers, and footers"""
+    # Search main body first
+    sdt = get_content_control_by_tag(doc._element, tag)
+    if sdt is not None:
+        return sdt
+
+    # Search headers and footers in all sections
+    for section in doc.sections:
+        for part in [
+            section.header,
+            section.footer,
+            section.even_page_header,
+            section.even_page_footer,
+            section.first_page_header,
+            section.first_page_footer,
+        ]:
+            try:
+                if part and part._element is not None:
+                    sdt = get_content_control_by_tag(part._element, tag)
+                    if sdt is not None:
+                        return sdt
+            except Exception:
+                pass
+
+    return None
+
+
 def set_content_control_text(sdt, text, font_name=None, font_size=None, color='auto'):
-    """Set text in a content control with optional formatting"""
+    """Set text in a content control with optional formatting.
+
+    Handles three structural variants found in Word content controls:
+      1. sdtContent > w:p  (block content control)
+      2. sdtContent > w:r  (inline/run-level content control, no paragraph)
+      3. sdtContent exists but is empty — a new run is appended directly
+    """
     namespace = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+    W = namespace['w']
 
     content = sdt.find('.//w:sdtContent', namespace)
     if content is None:
         return False
 
-    para = content.find('.//w:p', namespace)
-    if para is None:
-        return False
+    # ── helper: build a single run element ──────────────────────────────────
+    def make_run(line_text):
+        run = parse_xml(f'<w:r xmlns:w="{W}"></w:r>')
+        rPr = parse_xml(f'<w:rPr xmlns:w="{W}"></w:rPr>')
+        run.insert(0, rPr)
 
-    # Clear existing runs
-    for run in para.findall('.//w:r', namespace):
-        para.remove(run)
+        if font_name:
+            rPr.append(parse_xml(
+                f'<w:rFonts xmlns:w="{W}" '
+                f'w:ascii="{font_name}" w:hAnsi="{font_name}" w:cs="{font_name}"/>'
+            ))
+        if font_size:
+            size_val = str(int(font_size) * 2)
+            rPr.append(parse_xml(f'<w:sz xmlns:w="{W}" w:val="{size_val}"/>'))
+            rPr.append(parse_xml(f'<w:szCs xmlns:w="{W}" w:val="{size_val}"/>'))
+        if color in ('auto', 'black'):
+            rPr.append(parse_xml(f'<w:color xmlns:w="{W}" w:val="auto"/>'))
+
+        t_elem = parse_xml(f'<w:t xmlns:w="{W}" xml:space="preserve"></w:t>')
+        t_elem.text = line_text
+        run.append(t_elem)
+        return run
 
     lines = str(text).split('\n')
 
+    # ── Variant 1: block content control — has a <w:p> child ────────────────
+    para = content.find('.//w:p', namespace)
+    if para is not None:
+        # Remove only direct run children (preserve paragraph properties)
+        for run in para.findall('w:r', namespace):
+            para.remove(run)
+        for wrapper in para.findall('w:ins', namespace) + para.findall('w:del', namespace):
+            para.remove(wrapper)
+
+        for i, line in enumerate(lines):
+            para.append(make_run(line))
+            if i < len(lines) - 1:
+                para.append(parse_xml(f'<w:r xmlns:w="{W}"><w:br/></w:r>'))
+        return True
+
+    # ── Variant 2: inline content control — sdtContent contains w:r directly ─
+    for old_run in content.findall('w:r', namespace):
+        content.remove(old_run)
+
     for i, line in enumerate(lines):
-        run = parse_xml(f'<w:r xmlns:w="{namespace["w"]}"></w:r>')
-
-        # Create run properties
-        rPr = parse_xml(f'<w:rPr xmlns:w="{namespace["w"]}"></w:rPr>')
-        run.insert(0, rPr)
-
-        # Set font if specified
-        if font_name:
-            font_elem = parse_xml(
-                f'<w:rFonts xmlns:w="{namespace["w"]}" '
-                f'w:ascii="{font_name}" w:hAnsi="{font_name}" '
-                f'w:cs="{font_name}"/>'
-            )
-            rPr.append(font_elem)
-
-        # Set font size if specified
-        if font_size:
-            size_val = str(int(font_size) * 2)
-            sz_elem = parse_xml(
-                f'<w:sz xmlns:w="{namespace["w"]}" w:val="{size_val}"/>'
-            )
-            szCs_elem = parse_xml(
-                f'<w:szCs xmlns:w="{namespace["w"]}" w:val="{size_val}"/>'
-            )
-            rPr.append(sz_elem)
-            rPr.append(szCs_elem)
-
-        # Set color to black/automatic
-        if color == 'auto' or color == 'black':
-            color_elem = parse_xml(
-                f'<w:color xmlns:w="{namespace["w"]}" w:val="auto"/>'
-            )
-            rPr.append(color_elem)
-
-        # Create text element
-        t_elem = parse_xml(
-            f'<w:t xmlns:w="{namespace["w"]}" xml:space="preserve"></w:t>'
-        )
-        t_elem.text = line
-        run.append(t_elem)
-
-        para.append(run)
-
-        # Add line break after each line except the last
+        content.append(make_run(line))
         if i < len(lines) - 1:
-            br_run = parse_xml(
-                f'<w:r xmlns:w="{namespace["w"]}"><w:br/></w:r>'
-            )
-            para.append(br_run)
+            content.append(parse_xml(f'<w:r xmlns:w="{W}"><w:br/></w:r>'))
 
     return True
 
@@ -807,7 +899,7 @@ def populate_content_controls_by_tag(
         else:
             value, font_name, font_size, color = value_info, None, None, 'auto'
 
-        sdt = get_content_control_by_tag(doc_element, tag)
+        sdt = get_content_control_by_tag_anywhere(doc, tag)
 
         if sdt is not None:
             # Special handling for invoice tables
@@ -841,6 +933,19 @@ def populate_word_template(
     property_address = row.get("cr7de_buildingaddress", "")
     unit = row.get("cr7de_unitnumber", "")
     building_address = row.get("cr7de_buildingaddress", "")
+
+    # Normalize NaN/None to empty string
+    if pd.isna(property_address) if not isinstance(property_address, str) else not property_address:
+        property_address = ""
+    if pd.isna(unit) if not isinstance(unit, str) else not unit:
+        unit = ""
+    if pd.isna(building_address) if not isinstance(building_address, str) else not building_address:
+        building_address = ""
+
+    logger.info(f"cr7de_buildingaddress = '{property_address}'")
+    logger.info(f"cr7de_unitnumber     = '{unit}'")
+    logger.info(f"Available closing ticket columns: {list(closing_ticket_df.columns)}")
+
     closing_agent_name = row.get("cr7de_closingagentname", "")
     closing_agent_phone = row.get("cr7de_closingagentphone", "")
     closing_agent_email = row.get("cr7de_closingagentemail", "")
@@ -951,12 +1056,17 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             graph_token, user_email, base_folder, ticket_value,
         )
 
-        # Archive existing file if present
+        # Archive existing condo invoice file if present
         archive_active_file_if_exists(
             graph_token, user_email, active_folder, inactive_folder, output_word_name,
         )
 
-        # Download template from OneDrive
+        # Archive any Closing_Form files (pdf/xlsx) if present
+        archive_closing_form_files_if_exist(
+            graph_token, user_email, active_folder, inactive_folder, ticket_value,
+        )
+
+        # Download template from OneDrive OneDrive
         download_template_from_onedrive(
             graph_token, user_email, template_path, local_template_path,
         )
