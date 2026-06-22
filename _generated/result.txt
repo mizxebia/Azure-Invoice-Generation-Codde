@@ -1,0 +1,4 @@
+XML VALID
+
+Row 1 XML:
+<row r="1" spans="1:4"><c r="B1" s="5"/><c r="C1" s="6" t="s"><v>0</v></c><c t="inlineStr" r="D1" s="11"><is><t>06/22/2026</t></is></c></row>
