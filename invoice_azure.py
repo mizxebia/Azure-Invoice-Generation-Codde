@@ -986,16 +986,18 @@ def _escape_xml(value):
     return s
 
 
-def _set_cell_in_sheet_xml(sheet_xml: str, addr: str, value) -> str:
+def _set_cell_in_sheet_xml(sheet_xml: str, addr: str, value, style=None) -> str:
     """
     Patch a single cell in worksheet XML.
 
     Handles both regular <c ...>...</c> and self-closing <c ... /> cells.
     Replaces the cell with an inlineStr value.
     If the cell doesn't exist, inserts it into the correct <row>.
+    style: optional Excel style index string (s= attribute) to apply.
     """
     escaped = _escape_xml(value)
     row_num, _ = _cell_addr_to_row_col(addr)
+    style_attr = f' s="{style}"' if style is not None else ""
 
     # ── 1a. Replace self-closing cell: <c r="ADDR" ... /> ────────────────────
     self_closing_pattern = re.compile(
@@ -1005,7 +1007,11 @@ def _set_cell_in_sheet_xml(sheet_xml: str, addr: str, value) -> str:
     def replace_self_closing(m):
         tag = m.group(0)[:-2]  # remove '/>'
         tag = re.sub(r'\s*\bt="[^"]*"', "", tag)
-        tag = re.sub(r'(<c\b)', r'\1 t="inlineStr"', tag, count=1)
+        if style is not None:
+            tag = re.sub(r'\s*\bs="[^"]*"', "", tag)
+            tag = re.sub(r'(<c\b)', rf'\1 t="inlineStr"{style_attr}', tag, count=1)
+        else:
+            tag = re.sub(r'(<c\b)', r'\1 t="inlineStr"', tag, count=1)
         return f'{tag}><is><t>{escaped}</t></is></c>'
 
     new_xml, count = self_closing_pattern.subn(replace_self_closing, sheet_xml)
@@ -1024,7 +1030,11 @@ def _set_cell_in_sheet_xml(sheet_xml: str, addr: str, value) -> str:
             return m.group(0)
         open_tag = open_tag_match.group(0)
         open_tag = re.sub(r'\s*\bt="[^"]*"', "", open_tag)
-        open_tag = re.sub(r'(<c\b)', r'\1 t="inlineStr"', open_tag, count=1)
+        if style is not None:
+            open_tag = re.sub(r'\s*\bs="[^"]*"', "", open_tag)
+            open_tag = re.sub(r'(<c\b)', rf'\1 t="inlineStr"{style_attr}', open_tag, count=1)
+        else:
+            open_tag = re.sub(r'(<c\b)', r'\1 t="inlineStr"', open_tag, count=1)
         return f'{open_tag}<is><t>{escaped}</t></is></c>'
 
     new_xml, count = cell_pattern.subn(replace_cell, sheet_xml)
@@ -1038,7 +1048,7 @@ def _set_cell_in_sheet_xml(sheet_xml: str, addr: str, value) -> str:
     )
 
     def insert_into_row(m):
-        new_cell = f'<c r="{addr}" t="inlineStr"><is><t>{escaped}</t></is></c>'
+        new_cell = f'<c r="{addr}" t="inlineStr"{style_attr}><is><t>{escaped}</t></is></c>'
         return m.group(1) + m.group(2) + new_cell + m.group(3)
 
     new_xml, count = row_pattern.subn(insert_into_row, sheet_xml)
@@ -1048,7 +1058,7 @@ def _set_cell_in_sheet_xml(sheet_xml: str, addr: str, value) -> str:
     # ── 3. Row not found — insert a new row before </sheetData> ──────────────
     new_row = (
         f'<row r="{row_num}">'
-        f'<c r="{addr}" t="inlineStr"><is><t>{escaped}</t></is></c>'
+        f'<c r="{addr}" t="inlineStr"{style_attr}><is><t>{escaped}</t></is></c>'
         f'</row>'
     )
     return sheet_xml.replace("</sheetData>", new_row + "</sheetData>", 1)
@@ -1084,6 +1094,7 @@ def populate_excel_template_local(
     closing_agent_email = row.get("cr7de_closingagentemail", "")
     closing_agent_title = row.get("cr7de_titlerole", "")
     notes = row.get("cr7de_notes", "")
+    building_name = row.get("cr7de_buildingname", "")
     current_date = datetime.now().strftime("%m/%d/%Y")
 
     try:
@@ -1116,36 +1127,71 @@ def populate_excel_template_local(
             f"Available columns: {invoice_df.columns.tolist()}"
         )
 
+    # Style 8 = wrapText + center + border (matches D column data rows)
+    WRAP_STYLE = "8"
+
     seller_df = invoice_df[invoice_df["cr7de_paidby"] == 716070000]
     for idx, (_, inv_row) in enumerate(seller_df.iterrows()):
         r = 15 + idx
+        payable_to = get_choice_label(PAYABLE_MAP, inv_row.get("cr7de_payableto", ""))
+        if payable_to == "Building" and building_name:
+            payable_to = building_name
         cell_updates[f"A{r}"] = inv_row.get("cr7de_chequenumber", "")
         cell_updates[f"B{r}"] = get_choice_label(DUE_AT_CLOSING_MAP, inv_row.get("cr109_dueatclosing", ""))
         cell_updates[f"C{r}"] = inv_row.get("cr7de_amount", "")
-        cell_updates[f"D{r}"] = get_choice_label(PAYABLE_MAP, inv_row.get("cr7de_payableto", ""))
+        cell_updates[f"D{r}"] = payable_to
+        cell_updates[f"E{r}"] = inv_row.get("cr7de_remarks", "")
 
     buyer_df = invoice_df[invoice_df["cr7de_paidby"] == 716070001]
     for idx, (_, inv_row) in enumerate(buyer_df.iterrows()):
         r = 45 + idx
+        payable_to = get_choice_label(PAYABLE_MAP, inv_row.get("cr7de_payableto", ""))
+        if payable_to == "Building" and building_name:
+            payable_to = building_name
         cell_updates[f"A{r}"] = inv_row.get("cr7de_chequenumber", "")
         cell_updates[f"B{r}"] = get_choice_label(DUE_AT_CLOSING_MAP, inv_row.get("cr109_dueatclosing", ""))
         cell_updates[f"C{r}"] = inv_row.get("cr7de_amount", "")
-        cell_updates[f"D{r}"] = get_choice_label(PAYABLE_MAP, inv_row.get("cr7de_payableto", ""))
+        cell_updates[f"D{r}"] = payable_to
+        cell_updates[f"E{r}"] = inv_row.get("cr7de_remarks", "")
 
+    TARGET_SHEET = "Closing Check Transmittal Form"
     SHEET_ENTRY = "xl/worksheets/sheet1.xml"
+    WORKBOOK_ENTRY = "xl/workbook.xml"
 
     with zipfile.ZipFile(template_path, "r") as zin:
         entries = zin.namelist()
         sheet_xml = zin.read(SHEET_ENTRY).decode("utf-8")
+        workbook_xml = zin.read(WORKBOOK_ENTRY).decode("utf-8")
 
+        # Patch cell values — E column cells get wrap-text style (s=8)
         for addr, value in cell_updates.items():
-            sheet_xml = _set_cell_in_sheet_xml(sheet_xml, addr, value)
+            if addr.startswith("E"):
+                sheet_xml = _set_cell_in_sheet_xml(sheet_xml, addr, value, style=WRAP_STYLE)
+            else:
+                sheet_xml = _set_cell_in_sheet_xml(sheet_xml, addr, value)
+
+        # Hide all sheets except the target so PDF only contains one sheet
+        def hide_non_target_sheets(wb_xml):
+            def patch_sheet(m):
+                name = m.group(1)
+                rest = m.group(2)
+                if name == TARGET_SHEET:
+                    rest = re.sub(r'\s*state="[^"]*"', "", rest)
+                    return f'<sheet name="{name}"{rest}/>'
+                else:
+                    rest = re.sub(r'\s*state="[^"]*"', "", rest)
+                    return f'<sheet name="{name}"{rest} state="hidden"/>'
+            return re.sub(r'<sheet name="([^"]+)"([^/]*)/>', patch_sheet, wb_xml)
+
+        workbook_xml = hide_non_target_sheets(workbook_xml)
 
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
             for entry in entries:
                 if entry == SHEET_ENTRY:
                     zout.writestr(entry, sheet_xml.encode("utf-8"))
+                elif entry == WORKBOOK_ENTRY:
+                    zout.writestr(entry, workbook_xml.encode("utf-8"))
                 else:
                     zout.writestr(entry, zin.read(entry))
 
