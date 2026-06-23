@@ -720,14 +720,17 @@ def create_table_in_content_control(sdt, invoice_df, building_address):
         )
         payable_to_code = row_data.get("cr7de_payableto", "")
         payable_to = get_choice_label(PAYABLE_MAP, payable_to_code)
-        
-        # If payable to is Building, use building address
+
         if payable_to == "Building":
             if building_address and building_address.strip():
                 payable_to = building_address
             else:
                 payable_to = "Building"
-        
+        elif payable_to == "AKAM":
+            payable_to = "AKAM Associates, Inc"
+        elif payable_to == "Other":
+            payable_to = row_data.get("cr109_otherpayableto", "") or "Other"
+
         # Format amount
         try:
             amount_float = float(amount) if amount else 0.0
@@ -941,14 +944,17 @@ def build_invoice_table_html(invoice_df, building_address):
         )
         payable_to_code = row.get("cr7de_payableto", "")
         payable_to = get_choice_label(PAYABLE_MAP, payable_to_code)
-        
-        # If payable to is Building, use building address
+
         if payable_to == "Building":
             if building_address and building_address.strip():
                 payable_to = building_address
             else:
                 payable_to = "Building"
-        
+        elif payable_to == "AKAM":
+            payable_to = "AKAM Associates, Inc"
+        elif payable_to == "Other":
+            payable_to = row.get("cr109_otherpayableto", "") or "Other"
+
         # Format amount with currency
         try:
             amount_float = float(amount) if amount else 0.0
@@ -977,7 +983,7 @@ def populate_word_template(
     
     property_address = row.get("cr7de_buildingaddress", "")
     unit = row.get("cr7de_unitnumber", "")
-    building_address = row.get("cr7de_buildingaddress", "")
+    building_address = row.get("cr109_legalname", "") or row.get("cr7de_buildingaddress", "")
 
     # Normalize NaN/None to empty string
     if pd.isna(property_address) if not isinstance(property_address, str) else not property_address:

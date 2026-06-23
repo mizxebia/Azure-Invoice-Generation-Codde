@@ -859,7 +859,7 @@ def populate_excel_template_local(
     closing_agent_email = row.get("cr7de_closingagentemail", "")
     closing_agent_title = row.get("cr7de_titlerole", "")
     notes = row.get("cr7de_notes", "")
-    building_name = row.get("cr7de_buildingname", "")
+    building_name = row.get("cr109_legalname", "")
     current_date = datetime.now().strftime("%m/%d/%Y")
 
     try:
@@ -878,6 +878,7 @@ def populate_excel_template_local(
         "D6": seller_tcode,
         "D7": property_address,
         "D8": unit,
+        "B11": row.get("cr109_locationofclosing", ""),
         "C13": seller1_name,
         "C43": buyer1_name,
         "B86": closing_agent,
@@ -896,11 +897,14 @@ def populate_excel_template_local(
         payable_to = get_choice_label(PAYABLE_MAP, inv_row.get("cr7de_payableto", ""))
         if payable_to == "Building" and building_name:
             payable_to = building_name
+        elif payable_to == "AKAM":
+            payable_to = "AKAM Associates, Inc"
+        elif payable_to == "Other":
+            payable_to = inv_row.get("cr109_otherpayableto", "") or "Other"
         cell_updates[f"A{r}"] = inv_row.get("cr7de_chequenumber", "")
         cell_updates[f"B{r}"] = get_choice_label(DUE_AT_CLOSING_MAP, inv_row.get("cr109_dueatclosing", ""))
         cell_updates[f"C{r}"] = inv_row.get("cr7de_amount", "")
         cell_updates[f"D{r}"] = payable_to
-        cell_updates[f"E{r}"] = inv_row.get("cr7de_remarks", "")
 
     buyer_df = invoice_df[invoice_df["cr7de_paidby"] == 716070001]
     for idx, (_, inv_row) in enumerate(buyer_df.iterrows()):
@@ -908,11 +912,14 @@ def populate_excel_template_local(
         payable_to = get_choice_label(PAYABLE_MAP, inv_row.get("cr7de_payableto", ""))
         if payable_to == "Building" and building_name:
             payable_to = building_name
+        elif payable_to == "AKAM":
+            payable_to = "AKAM Associates, Inc"
+        elif payable_to == "Other":
+            payable_to = inv_row.get("cr109_otherpayableto", "") or "Other"
         cell_updates[f"A{r}"] = inv_row.get("cr7de_chequenumber", "")
         cell_updates[f"B{r}"] = get_choice_label(DUE_AT_CLOSING_MAP, inv_row.get("cr109_dueatclosing", ""))
         cell_updates[f"C{r}"] = inv_row.get("cr7de_amount", "")
         cell_updates[f"D{r}"] = payable_to
-        cell_updates[f"E{r}"] = inv_row.get("cr7de_remarks", "")
 
     # The main sheet is always xl/worksheets/sheet1.xml
     TARGET_SHEET = "Closing Check Transmittal Form"
